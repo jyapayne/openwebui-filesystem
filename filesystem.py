@@ -87,6 +87,26 @@ class Tools:
         else:
             logger.setLevel(logging.INFO)
 
+    async def _emit_status(self, __event_emitter__, description: str, done: bool = False, **extra: Any) -> None:
+        """Safely emit a status event if an emitter is provided.
+
+        The emitter expects a payload of the form:
+            {"type": "status", "data": {"description": str, "done": bool, ...}}
+        """
+        if __event_emitter__ is None:
+            return
+        try:
+            payload: Dict[str, Any] = {
+                "type": "status",
+                "data": {"description": description, "done": done},
+            }
+            if extra:
+                payload["data"].update(extra)
+            await __event_emitter__(payload)
+        except Exception:
+            # Never allow status emission failures to interrupt tool execution
+            pass
+
     def _result(self, ok: bool, action: str = "", subject_type: str = "", **kwargs) -> Dict[str, Any]:
         """Helper function to create consistent result format."""
         result = {"ok": ok, "action": action, "subject_type": subject_type}
@@ -1492,7 +1512,8 @@ class Tools:
         base_dir: Optional[str] = None,
         case_sensitive: bool = True,
         include_content: bool = True,
-        max_results: int = 100
+        max_results: int = 100,
+        __event_emitter__=None
     ) -> Dict[str, Any]:
         """
         Search for files containing the keyword in their names or content.
@@ -1506,6 +1527,7 @@ class Tools:
         try:
             base_path = base_dir if base_dir else "."
             search_path = self._resolve_under_restriction(base_path)
+            await self._emit_status(__event_emitter__, f"Searching for '{keyword}' in {self._get_relative_path(search_path)}")
             
             if not await aiofiles.os.path.exists(search_path):
                 return self._result(
@@ -1533,7 +1555,7 @@ class Tools:
             )
             
             logger.info(f"Search for keyword '{keyword}' completed with {len(matches)} matches")
-            return self._result(
+            result = self._result(
                 True,
                 action="search",
                 subject_type="directory",
@@ -1543,6 +1565,8 @@ class Tools:
                 case_sensitive=case_sensitive,
                 truncated=len(matches) >= max_results
             )
+            await self._emit_status(__event_emitter__, f"Search complete: {len(matches)} match(es)", done=True)
+            return result
         except ValueError as e:
             return self._result(False, action="search", subject_type="directory", error=str(e))
         except OSError as e:
@@ -1613,7 +1637,8 @@ class Tools:
         base_dir: Optional[str] = None,
         case_sensitive: bool = True,
         include_extensions: bool = True,
-        max_results: int = 100
+        max_results: int = 100,
+        __event_emitter__=None
     ) -> Dict[str, Any]:
         """
         Search for files by name and/or extension only (no content search).
@@ -1627,6 +1652,7 @@ class Tools:
         try:
             base_path = base_dir if base_dir else "."
             search_path = self._resolve_under_restriction(base_path)
+            await self._emit_status(__event_emitter__, f"Searching names for '{pattern}' in {self._get_relative_path(search_path)}")
             
             if not await aiofiles.os.path.exists(search_path):
                 return self._result(
@@ -1654,7 +1680,7 @@ class Tools:
             )
             
             logger.info(f"File name search for pattern '{pattern}' completed with {len(matches)} matches")
-            return self._result(
+            result = self._result(
                 True,
                 action="search_file_names",
                 subject_type="directory",
@@ -1665,6 +1691,8 @@ class Tools:
                 include_extensions=include_extensions,
                 truncated=len(matches) >= max_results
             )
+            await self._emit_status(__event_emitter__, f"Name search complete: {len(matches)} match(es)", done=True)
+            return result
         except ValueError as e:
             return self._result(False, action="search_file_names", subject_type="directory", error=str(e))
         except OSError as e:
@@ -1985,7 +2013,8 @@ class Tools:
         prompt: str = "Please analyze this file",
         base_dir: Optional[str] = None,
         model: Optional[str] = None,
-        max_tokens: int = 1000
+        max_tokens: int = 1000,
+        __event_emitter__=None
     ) -> Dict[str, Any]:
         """
         Upload a file to OpenRouter for analysis by a vision-capable model.
@@ -2008,6 +2037,7 @@ class Tools:
 
             base_path = base_dir if base_dir else "."
             file_path = self._resolve_under_restriction(os.path.join(base_path, file_name))
+            await self._emit_status(__event_emitter__, f"Uploading to OpenRouter: {self._get_relative_path(file_path)}")
             
             if not await aiofiles.os.path.exists(file_path):
                 return self._result(
@@ -2169,7 +2199,7 @@ class Tools:
                             analysis = result["choices"][0]["message"]["content"]
                             
                             logger.info(f"File '{file_name}' successfully analyzed by OpenRouter model '{model_name}'")
-                            return self._result(
+                            final = self._result(
                                 True,
                                 action="openrouter_upload",
                                 subject_type="file",
@@ -2182,6 +2212,8 @@ class Tools:
                                 usage=result.get("usage", {}),
                                 response_id=result.get("id", "")
                             )
+                            await self._emit_status(__event_emitter__, "OpenRouter analysis complete", done=True)
+                            return final
                         else:
                             return self._result(
                                 False,
@@ -2199,13 +2231,15 @@ class Tools:
                             error_text = await response.text()
                             error_msg += f" - {error_text}"
                         
-                        return self._result(
+                        failed = self._result(
                             False,
                             action="openrouter_upload",
                             subject_type="file",
                             error=error_msg,
                             status_code=response.status
                         )
+                        await self._emit_status(__event_emitter__, f"OpenRouter request failed: {response.status}", done=True)
+                        return failed
 
         except aiohttp.ClientError as e:
             return self._result(
@@ -2235,7 +2269,8 @@ class Tools:
         prompt: str = "Please analyze these files",
         base_dir: Optional[str] = None,
         model: Optional[str] = None,
-        max_tokens: int = 1000
+        max_tokens: int = 1000,
+        __event_emitter__=None
     ) -> Dict[str, Any]:
         """
         Upload multiple files to OpenRouter for batch analysis.
@@ -2259,13 +2294,16 @@ class Tools:
             successful = 0
             failed = 0
 
-            for file_name in file_names:
+            total = len(file_names)
+            for index, file_name in enumerate(file_names, start=1):
+                await self._emit_status(__event_emitter__, f"[{index}/{total}] Uploading: {file_name}")
                 result = await self._upload_file_to_openrouter(
                     file_name=file_name,
                     prompt=prompt,
                     base_dir=base_dir,
                     model=model,
-                    max_tokens=max_tokens
+                    max_tokens=max_tokens,
+                    __event_emitter__=__event_emitter__
                 )
                 
                 results.append({
@@ -2280,7 +2318,7 @@ class Tools:
                     failed += 1
 
             logger.info(f"Batch upload completed: {successful} successful, {failed} failed")
-            return self._result(
+            final = self._result(
                 True,
                 action="openrouter_batch_upload",
                 subject_type="files",
@@ -2289,6 +2327,8 @@ class Tools:
                 failed=failed,
                 results=results
             )
+            await self._emit_status(__event_emitter__, f"Batch upload complete: {successful} successful, {failed} failed", done=True)
+            return final
 
         except Exception as e:
             return self._result(
@@ -2304,7 +2344,8 @@ class Tools:
         base_dir: Optional[str] = None,
         transcription_mode: str = "auto",
         language: Optional[str] = None,
-        output_format: str = "text"
+        output_format: str = "text",
+        __event_emitter__=None
     ) -> Dict[str, Any]:
         """
         Transcribe text content from any supported file type using OpenRouter models.
@@ -2401,11 +2442,13 @@ class Tools:
                 prompt += f" The text is expected to be in {language}."
 
             # Use the existing OpenRouter upload method
+            await self._emit_status(__event_emitter__, f"Transcribing via OpenRouter: {file_name}")
             result = await self._upload_file_to_openrouter(
                 file_name=file_name,
                 prompt=prompt,
                 base_dir=base_dir,
-                max_tokens=10000  # Higher token limit for transcription
+                max_tokens=10000,  # Higher token limit for transcription
+                __event_emitter__=__event_emitter__
             )
 
             if result["ok"]:
@@ -2419,7 +2462,7 @@ class Tools:
                     transcribed_text = re.sub(r'\n\s*\n', '\n\n', transcribed_text)
 
                 logger.info(f"File '{file_name}' transcribed successfully using mode '{transcription_mode}'")
-                return self._result(
+                final = self._result(
                     True,
                     action="transcribe",
                     subject_type="file",
@@ -2435,6 +2478,8 @@ class Tools:
                     character_count=len(transcribed_text) if transcribed_text else 0,
                     usage=result.get("usage", {})
                 )
+                await self._emit_status(__event_emitter__, "Transcription complete", done=True)
+                return final
             else:
                 return self._result(
                     False,
@@ -2465,7 +2510,8 @@ class Tools:
         base_dir: Optional[str] = None,
         transcription_mode: str = "auto",
         language: Optional[str] = None,
-        output_format: str = "text"
+        output_format: str = "text",
+        __event_emitter__=None
     ) -> Dict[str, Any]:
         """
         Transcribe multiple files in batch using OpenRouter models.
@@ -2492,13 +2538,16 @@ class Tools:
             total_words = 0
             total_characters = 0
 
-            for file_name in file_names:
+            total = len(file_names)
+            for index, file_name in enumerate(file_names, start=1):
+                await self._emit_status(__event_emitter__, f"[{index}/{total}] Transcribing: {file_name}")
                 result = await self.transcribe_file(
                     file_name=file_name,
                     base_dir=base_dir,
                     transcription_mode=transcription_mode,
                     language=language,
-                    output_format=output_format
+                    output_format=output_format,
+                    __event_emitter__=__event_emitter__
                 )
                 
                 results.append({
@@ -2515,7 +2564,7 @@ class Tools:
                     failed += 1
 
             logger.info(f"Batch transcription completed: {successful} successful, {failed} failed")
-            return self._result(
+            final = self._result(
                 True,
                 action="batch_transcribe",
                 subject_type="files",
@@ -2529,6 +2578,8 @@ class Tools:
                 language=language,
                 results=results
             )
+            await self._emit_status(__event_emitter__, f"Batch transcription complete: {successful} successful, {failed} failed", done=True)
+            return final
 
         except Exception as e:
             return self._result(
@@ -2544,7 +2595,8 @@ class Tools:
         base_dir: Optional[str] = None,
         description_type: str = "detailed",
         model: Optional[str] = None,
-        max_tokens: int = 1000
+        max_tokens: int = 1000,
+        __event_emitter__=None
     ) -> Dict[str, Any]:
         """
         Describe an image using OpenRouter vision models.
@@ -2610,19 +2662,21 @@ class Tools:
                 prompt = f"Please describe this image with a focus on: {description_type}"
 
             # Use the existing OpenRouter upload method
+            await self._emit_status(__event_emitter__, f"Describing image via OpenRouter: {file_name}")
             result = await self._upload_file_to_openrouter(
                 file_name=file_name,
                 prompt=prompt,
                 base_dir=base_dir,
                 model=model,
-                max_tokens=max_tokens
+                max_tokens=max_tokens,
+                __event_emitter__=__event_emitter__
             )
 
             if result["ok"]:
                 description = result.get("analysis", "")
                 
                 logger.info(f"Image '{file_name}' described successfully using '{description_type}' style")
-                return self._result(
+                final = self._result(
                     True,
                     action="describe_image",
                     subject_type="file",
@@ -2637,6 +2691,8 @@ class Tools:
                     usage=result.get("usage", {}),
                     response_id=result.get("response_id", "")
                 )
+                await self._emit_status(__event_emitter__, "Image description complete", done=True)
+                return final
             else:
                 return self._result(
                     False,
@@ -2667,7 +2723,8 @@ class Tools:
         base_dir: Optional[str] = None,
         description_type: str = "detailed",
         model: Optional[str] = None,
-        max_tokens: int = 1000
+        max_tokens: int = 1000,
+        __event_emitter__=None
     ) -> Dict[str, Any]:
         """
         Describe multiple images in batch using OpenRouter vision models.
@@ -2694,13 +2751,16 @@ class Tools:
             total_words = 0
             total_characters = 0
 
-            for file_name in file_names:
+            total = len(file_names)
+            for index, file_name in enumerate(file_names, start=1):
+                await self._emit_status(__event_emitter__, f"[{index}/{total}] Describing image: {file_name}")
                 result = await self.describe_image(
                     file_name=file_name,
                     base_dir=base_dir,
                     description_type=description_type,
                     model=model,
-                    max_tokens=max_tokens
+                    max_tokens=max_tokens,
+                    __event_emitter__=__event_emitter__
                 )
                 
                 results.append({
@@ -2717,7 +2777,7 @@ class Tools:
                     failed += 1
 
             logger.info(f"Batch image description completed: {successful} successful, {failed} failed")
-            return self._result(
+            final = self._result(
                 True,
                 action="batch_describe_images",
                 subject_type="files",
@@ -2730,6 +2790,8 @@ class Tools:
                 model=model or self.valves.openrouter_model,
                 results=results
             )
+            await self._emit_status(__event_emitter__, f"Batch image description complete: {successful} successful, {failed} failed", done=True)
+            return final
 
         except Exception as e:
             return self._result(
