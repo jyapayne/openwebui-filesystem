@@ -118,26 +118,37 @@ class Tools:
         return str(p)
 
     def _get_relative_path(self, absolute_path: str) -> str:
-        """Convert absolute path to relative path from display root (spoof directory)."""
-        if not self.valves.return_relative_paths:
-            return absolute_path
+        """Format a path for display, honoring spoof directory regardless of relative flag.
+
+        - When valves.return_relative_paths is True: return a path scoped to the display root.
+          If a spoof directory is configured, the returned path is shown under that root.
+          Otherwise, it is relative to the restriction root.
+        - When valves.return_relative_paths is False: return an absolute path, but if a spoof
+          directory is configured, replace the restriction root prefix with the spoof root so
+          that paths appear under the spoof directory.
+        """
         try:
-            # Use spoof directory root for display if set, otherwise use restriction root
-            display_root = self.valves.spoof_directory_root if self.valves.spoof_directory_root else self.valves.root_restriction_directory
             base = Path(self.valves.root_restriction_directory).resolve()
+            display_root = self.valves.spoof_directory_root or self.valves.root_restriction_directory
             spoof_base = Path(display_root).resolve()
-            
-            # Get relative path from actual restriction root
-            relative_from_actual = str(Path(absolute_path).relative_to(base))
-            
-            # If spoof directory is same as restriction directory, return as-is
+
+            resolved_absolute = str(Path(absolute_path).resolve())
+
+            # Compute the path relative to the actual restriction root (may raise ValueError)
+            relative_from_actual = str(Path(resolved_absolute).relative_to(base))
+
+            if self.valves.return_relative_paths:
+                # Show as if rooted at the display root. If spoof == base, keep purely relative.
+                if str(spoof_base) == str(base):
+                    return relative_from_actual
+                return str(spoof_base / relative_from_actual)
+
+            # Absolute mode: return absolute path, mapped to spoof root when spoofing
             if str(spoof_base) == str(base):
-                return relative_from_actual
-            
-            # Otherwise, prepend the spoof directory to the relative path
-            return str(Path(display_root) / relative_from_actual)
+                return resolved_absolute
+            return str(spoof_base / relative_from_actual)
         except ValueError:
-            # If path is not under base, return as-is
+            # If the path is not under the restriction root, return as-is
             return absolute_path
 
     async def _ensure_parent_dir(self, file_path: str) -> None:
