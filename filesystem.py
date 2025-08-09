@@ -6,7 +6,7 @@ git_url: https://github.com/jyapayne/openwebui-filesystem.git
 description: This tool provides a comprehensive set of file system operations, including file and directory management, search, and analysis.
 required_open_webui_version: 0.1.0
 requirements:
-version: 0.1.0
+version: 0.2.0
 licence: MIT
 """
 import os
